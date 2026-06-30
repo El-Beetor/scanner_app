@@ -99,6 +99,44 @@ def align_to_base(base_img, moving_img, min_matches=15):
     return cv2.warpAffine(moving_img, M, (w, h))
 
 
+def local_warp_patch(base, patch, x_start, x_end, context_width=200):
+    """
+    After global homography alignment there can still be local warp differences
+    (paper curl, perspective) right at the seam. This computes dense optical
+    flow between base and patch in a band around the artifact and applies that
+    local displacement to the patch before blending, giving a much tighter fit.
+    """
+    h, w = base.shape[:2]
+    rx0 = max(0, x_start - context_width)
+    rx1 = min(w, x_end + 1 + context_width)
+
+    gray_base = cv2.cvtColor(base[:, rx0:rx1], cv2.COLOR_BGR2GRAY).astype(np.float32)
+    gray_patch = cv2.cvtColor(patch[:, rx0:rx1], cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    flow = cv2.calcOpticalFlowFarneback(
+        gray_base, gray_patch,
+        None,
+        pyr_scale=0.5, levels=5, winsize=33,
+        iterations=10, poly_n=7, poly_sigma=1.5,
+        flags=cv2.OPTFLOW_FARNEBACK_GAUSSIAN,
+    )
+
+    roi_w = rx1 - rx0
+    grid_x, grid_y = np.meshgrid(np.arange(roi_w, dtype=np.float32),
+                                  np.arange(h, dtype=np.float32))
+    map_x = grid_x + flow[..., 0]
+    map_y = grid_y + flow[..., 1]
+
+    roi_patch = patch[:, rx0:rx1]
+    warped_roi = cv2.remap(roi_patch, map_x, map_y,
+                           interpolation=cv2.INTER_LINEAR,
+                           borderMode=cv2.BORDER_REPLICATE)
+
+    result = patch.copy()
+    result[:, rx0:rx1] = warped_roi
+    return result
+
+
 def match_local_tone(base, patch, x_start, x_end, context_width=60):
     """
     Adjust patch columns so their mean and std match the surrounding columns
@@ -225,8 +263,11 @@ def main():
         else:
             print(f"  image2's own line is at columns {line2_in_warped[0]}-{line2_in_warped[1]} (no overlap, good)")
 
+    print("Applying local optical-flow warp to patch region...")
+    warped2_local = local_warp_patch(img1, warped2, line1[0], line1[1])
+
     print("Matching local tone of patch to surrounding image...")
-    warped2_toned = match_local_tone(img1, warped2, line1[0], line1[1])
+    warped2_toned = match_local_tone(img1, warped2_local, line1[0], line1[1])
 
     print(f"Blending with method: {args.blend}...")
     if args.blend == "poisson":
@@ -242,6 +283,7 @@ def main():
         cv2.rectangle(debug, (line1[0], 0), (line1[1], debug.shape[0] - 1), (0, 0, 255), 3)
         cv2.imwrite("debug_detected_line.jpg", debug)
         cv2.imwrite("debug_warped_image2.jpg", warped2)
+        cv2.imwrite("debug_local_warped.jpg", warped2_local)
         cv2.imwrite("debug_toned_patch.jpg", warped2_toned)
         print("Saved debug images: debug_detected_line.jpg, debug_warped_image2.jpg, debug_toned_patch.jpg")
 
