@@ -12,18 +12,16 @@ page rotated underneath it.
 This script:
   1. Rotates the second image to match the first's orientation.
   2. Aligns the two scans precisely (ORB feature matching + homography).
-  3. Detects the artifact line's column range in each image.
+  3. Refines local alignment around the artifact using dense optical flow.
   4. Matches local brightness/contrast of the patch to surrounding columns.
-  5. Blends using Poisson seamless cloning to hide the seam.
-  6. Falls back to feathered blending if Poisson fails.
+  5. Feathers the patch into the base image to avoid a hard seam.
 
 Usage:
     python3 stitch_remove_scanline.py img1.jpg img2.jpg -o result.jpg
 
     Optional flags:
       --rotate-deg {0,90,180,270}   rotation needed to match img2 to img1 (default 180)
-      --feather N                   blend-feather width in px on each side (default 15)
-      --blend {poisson,feather}     blending method (default poisson)
+      --feather N                   blend-feather width in px on each side (default 40)
       --debug                       also save line-detection + alignment-diff debug images
 """
 
@@ -140,14 +138,12 @@ def local_warp_patch(base, patch, x_start, x_end, context_width=200):
 def match_local_tone(base, patch, x_start, x_end, context_width=60):
     """
     Adjust patch columns so their mean and std match the surrounding columns
-    in base. This corrects any exposure or contrast difference between the
-    two scans before blending.
+    in base, correcting any exposure or contrast difference between the two scans.
     """
     h, w = base.shape[:2]
     left = max(0, x_start - context_width)
     right = min(w, x_end + 1 + context_width)
 
-    # sample the base columns either side of the artifact (excluding the artifact itself)
     ref_cols = np.concatenate([
         base[:, left:x_start].reshape(-1, 3),
         base[:, x_end + 1:right].reshape(-1, 3)
@@ -168,42 +164,7 @@ def match_local_tone(base, patch, x_start, x_end, context_width=60):
     return np.clip(adjusted, 0, 255).astype(np.uint8)
 
 
-def poisson_blend(base, patch, x_start, x_end, feather=15):
-    """
-    Use Poisson seamless cloning to blend the patch strip into the base.
-    Operates only on a padded region around the artifact to keep it fast.
-    Falls back to feather blending if seamlessClone fails.
-    """
-    h, w = base.shape[:2]
-    pad = feather + 10
-    rx0 = max(0, x_start - pad)
-    rx1 = min(w, x_end + 1 + pad)
-
-    roi_base = base[:, rx0:rx1].copy()
-    roi_patch = patch[:, rx0:rx1].copy()
-    roi_w = rx1 - rx0
-
-    # mask: white only over the artifact columns (relative to the ROI)
-    mask = np.zeros((h, roi_w), dtype=np.uint8)
-    rel_start = x_start - rx0
-    rel_end = x_end - rx0
-    mask[:, rel_start:rel_end + 1] = 255
-
-    center = (roi_w // 2, h // 2)
-
-    try:
-        blended_roi = cv2.seamlessClone(roi_patch, roi_base, mask, center, cv2.NORMAL_CLONE)
-        result = base.copy()
-        result[:, rx0:rx1] = blended_roi
-        return result
-    except cv2.error as e:
-        print(f"  WARNING: Poisson blending failed ({e}), falling back to feather blend")
-        return feather_patch(base, patch, x_start, x_end, feather)
-
-
-def feather_patch(base, patch, x_start, x_end, feather=15):
-    """Replace columns [x_start, x_end] of base with patch's columns, feathering the
-    transition over `feather` px on each side so there's no hard seam."""
+def feather_patch(base, patch, x_start, x_end, feather=40):
     out = base.astype(np.float32).copy()
     patch = patch.astype(np.float32)
     h, w = base.shape[:2]
@@ -230,9 +191,7 @@ def main():
     ap.add_argument("-o", "--output", default="stitched_result.jpg", help="output file path")
     ap.add_argument("--rotate-deg", type=int, choices=[0, 90, 180, 270], default=180,
                      help="rotation to apply to image2 so it matches image1's orientation")
-    ap.add_argument("--feather", type=int, default=15, help="blend feather width in pixels")
-    ap.add_argument("--blend", choices=["poisson", "feather"], default="poisson",
-                     help="blending method: poisson (default, best quality) or feather")
+    ap.add_argument("--feather", type=int, default=40, help="blend feather width in pixels")
     ap.add_argument("--debug", action="store_true", help="save extra debug images")
     args = ap.parse_args()
 
@@ -269,11 +228,8 @@ def main():
     print("Matching local tone of patch to surrounding image...")
     warped2_toned = match_local_tone(img1, warped2_local, line1[0], line1[1])
 
-    print(f"Blending with method: {args.blend}...")
-    if args.blend == "poisson":
-        result = poisson_blend(img1, warped2_toned, line1[0], line1[1], feather=args.feather)
-    else:
-        result = feather_patch(img1, warped2_toned, line1[0], line1[1], feather=args.feather)
+    print("Blending with feather...")
+    result = feather_patch(img1, warped2_toned, line1[0], line1[1], feather=args.feather)
 
     cv2.imwrite(args.output, result)
     print(f"Saved result: {args.output}")
@@ -285,7 +241,7 @@ def main():
         cv2.imwrite("debug_warped_image2.jpg", warped2)
         cv2.imwrite("debug_local_warped.jpg", warped2_local)
         cv2.imwrite("debug_toned_patch.jpg", warped2_toned)
-        print("Saved debug images: debug_detected_line.jpg, debug_warped_image2.jpg, debug_toned_patch.jpg")
+        print("Saved debug images: debug_detected_line.jpg, debug_warped_image2.jpg, debug_local_warped.jpg, debug_toned_patch.jpg")
 
 
 if __name__ == "__main__":
