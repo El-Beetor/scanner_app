@@ -299,6 +299,41 @@ def resolve_dpi(args, img_path):
     return "default"
 
 
+def save_debug_steps(x_start, x_end, img1_orig, img1_corrected, warped2,
+                     warped2_local, warped2_toned, result):
+    """Save a full image and a seam crop for every pipeline step."""
+    pad = 300
+    h, w = img1_orig.shape[:2]
+    cx0 = max(0, x_start - pad)
+    cx1 = min(w, x_end + pad)
+
+    steps = [
+        ("01_original",        img1_orig,       "Image 1 before any processing"),
+        ("02_vertical_fixed",  img1_corrected,  "After 5px vertical sensor correction (right half shifted up)"),
+        ("03_img2_aligned",    warped2,         "Image 2 after global homography alignment to image 1"),
+        ("04_img2_flow_warped",warped2_local,   "Image 2 after local optical-flow refinement around seam"),
+        ("05_img2_tone_matched",warped2_toned,  "Image 2 after local tone/brightness matching"),
+        ("06_final_result",    result,          "Final blended result"),
+    ]
+
+    for name, img, label in steps:
+        # Full image with seam zone highlighted
+        annotated = img.copy()
+        cv2.rectangle(annotated, (x_start, 0), (x_end, h - 1), (0, 0, 255), 6)
+        cv2.putText(annotated, label, (50, 120), cv2.FONT_HERSHEY_SIMPLEX,
+                    3, (0, 0, 255), 6, cv2.LINE_AA)
+        cv2.imwrite(f"debug_{name}_full.jpg", annotated)
+
+        # Tight crop around the seam
+        crop = img[: , cx0:cx1].copy()
+        rel_start = x_start - cx0
+        rel_end   = x_end   - cx0
+        cv2.rectangle(crop, (rel_start, 0), (rel_end, crop.shape[0] - 1), (0, 0, 255), 4)
+        cv2.imwrite(f"debug_{name}_seam.jpg", crop)
+
+        print(f"  debug_{name}_full.jpg  +  debug_{name}_seam.jpg  —  {label}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -419,14 +454,15 @@ def main():
     print(f"Saved result: {args.output}")
 
     if args.debug:
-        debug = img1_corrected.copy()
-        cv2.rectangle(debug, (x_start, 0), (x_end, debug.shape[0] - 1), (0, 0, 255), 3)
-        cv2.imwrite("debug_detected_line.jpg", debug)
-        cv2.imwrite("debug_corrected_base.jpg", img1_corrected)
-        cv2.imwrite("debug_warped_image2.jpg", warped2)
-        cv2.imwrite("debug_local_warped.jpg", warped2_local)
-        cv2.imwrite("debug_toned_patch.jpg", warped2_toned)
-        print("Saved debug images.")
+        save_debug_steps(
+            x_start, x_end,
+            img1,
+            img1_corrected,
+            warped2,
+            warped2_local,
+            warped2_toned,
+            result,
+        )
 
 
 if __name__ == "__main__":
