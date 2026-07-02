@@ -213,19 +213,15 @@ class App(TkinterDnD.Tk):
             cfg     = pipeline.load_config()
             profile = cfg.get(pipeline.dpi_key(dpi_str), {})
 
-            # Line position
+            # Line position — always use saved calibration, never auto-detect
             if "line_start" in profile and "line_end" in profile:
                 x_start, x_end = profile["line_start"], profile["line_end"]
                 self._set_status(f"Using saved line: cols {x_start}–{x_end}")
             else:
-                self._set_status("Detecting artifact line…")
-                line = pipeline.detect_blue_line(img1)
-                if line is None:
-                    raise RuntimeError(
-                        "Could not detect the blue artifact line.\n"
-                        "Run --calibrate first or check your --dpi value.")
-                x_start, x_end = line
-                self._set_status(f"Line detected at cols {x_start}–{x_end}")
+                raise RuntimeError(
+                    f"No calibration found for DPI '{dpi_str}'.\n"
+                    f"Run:  python3 stitch_remove_scanline.py img1.jpg --calibrate --dpi {dpi_str}"
+                )
 
             v_offset = profile.get("vertical_offset", 0)
 

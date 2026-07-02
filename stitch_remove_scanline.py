@@ -393,20 +393,16 @@ def main():
     if args.image2 is None:
         ap.error("image2 is required for normal (non-calibrate) use")
 
-    # Resolve line position
+    # Resolve line position — always use saved calibration, never auto-detect
     if "line_start" in profile and "line_end" in profile:
         x_start, x_end = profile["line_start"], profile["line_end"]
         print(f"Using saved line position for DPI '{dpi}': columns {x_start}-{x_end} "
               f"(width {x_end-x_start+1}px)")
     else:
-        print(f"No saved line position for DPI '{dpi}'. Detecting...")
-        line = detect_blue_line(img1)
-        if line is None:
-            sys.exit("ERROR: could not detect a blue artifact line. "
-                     "Run with --calibrate first, or check --dpi value.")
-        x_start, x_end = line
-        print(f"  found at columns {x_start}-{x_end} (width {x_end-x_start+1}px)")
-        print("  Tip: run --calibrate to save this so detection is skipped next time.")
+        sys.exit(
+            f"ERROR: no calibration found for DPI '{dpi}'.\n"
+            f"Run:  python3 stitch_remove_scanline.py img1.jpg --calibrate --dpi {dpi}"
+        )
 
     # Resolve vertical offset
     if args.vertical_offset is not None:
