@@ -38,8 +38,16 @@ def load_image(path):
     return img
 
 
-def detect_blue_line(img, min_strength=500):
-    b, g, r = cv2.split(img.astype(np.int16))
+def detect_blue_line(img, min_strength=500, max_width=200):
+    """
+    Looks for a thin vertical blue artifact line. max_width guards against
+    picking up large blue regions (e.g. scanner head visible at top of frame).
+    """
+    h, w = img.shape[:2]
+    # Ignore the top 10% of the image where scanner hardware often shows up
+    scan_region = img[int(h * 0.10):, :]
+
+    b, g, r = cv2.split(scan_region.astype(np.int16))
     blueness = np.clip(b - np.maximum(r, g), 0, None)
     col_score = blueness.sum(axis=0).astype(np.float64)
 
@@ -60,6 +68,9 @@ def detect_blue_line(img, min_strength=500):
     x_end = peak_col
     while x_end < len(smoothed) - 1 and smoothed[x_end + 1] > threshold:
         x_end += 1
+
+    if (x_end - x_start + 1) > max_width:
+        return None
 
     return (x_start, x_end)
 
