@@ -60,7 +60,7 @@ def save_config(cfg):
     print(f"  Saved to {CONFIG_PATH}")
 
 
-def detect_blue_line(img, min_strength=500, max_width=200):
+def detect_blue_line(img, min_strength=500, max_width=500):
     """
     Looks for a thin vertical blue artifact line. max_width guards against
     picking up large blue regions (e.g. scanner head visible at top of frame).
@@ -79,7 +79,7 @@ def detect_blue_line(img, min_strength=500, max_width=200):
     peak_val = smoothed[peak_col]
     background = np.median(smoothed)
 
-    if peak_val < min_strength or peak_val < background * 20:
+    if peak_val < min_strength or peak_val < background * 8:
         return None
 
     threshold = background + (peak_val - background) * 0.12
