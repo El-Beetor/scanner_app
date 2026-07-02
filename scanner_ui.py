@@ -145,7 +145,7 @@ class App(TkinterDnD.Tk):
                  font=("Helvetica", 12)).grid(row=0, column=0, sticky="w")
 
         cfg = pipeline.load_config()
-        dpi_choices = [k.replace("dpi_", "") for k in cfg] or ["600"]
+        dpi_choices = [k.replace("dpi_", "") for k in cfg if k.startswith("dpi_")] or ["600"]
         self.dpi_var = tk.StringVar(value=dpi_choices[0])
         ttk.Combobox(opts, textvariable=self.dpi_var, values=dpi_choices,
                      width=7, state="readonly").grid(row=0, column=1, padx=(6, 28), sticky="w")
