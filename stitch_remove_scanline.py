@@ -300,7 +300,7 @@ def resolve_dpi(args, img_path):
 
 
 def save_debug_steps(x_start, x_end, img1_orig, img1_corrected, warped2,
-                     warped2_local, warped2_toned, result):
+                     warped2_toned, result):
     """Save a full image and a seam crop for every pipeline step."""
     pad = 300
     h, w = img1_orig.shape[:2]
@@ -311,8 +311,7 @@ def save_debug_steps(x_start, x_end, img1_orig, img1_corrected, warped2,
         ("01_original",        img1_orig,       "Image 1 before any processing"),
         ("02_vertical_fixed",  img1_corrected,  "After 5px vertical sensor correction (right half shifted up)"),
         ("03_img2_aligned",    warped2,         "Image 2 after global homography alignment to image 1"),
-        ("04_img2_flow_warped",warped2_local,   "Image 2 after local optical-flow refinement around seam"),
-        ("05_img2_tone_matched",warped2_toned,  "Image 2 after local tone/brightness matching"),
+        ("04_img2_tone_matched",warped2_toned,  "Image 2 after local tone/brightness matching"),
         ("06_final_result",    result,          "Final blended result"),
     ]
 
@@ -428,7 +427,7 @@ def main():
         img2_oriented = cv2.resize(img2_oriented, (img1.shape[1], img1.shape[0]))
 
     print("Correcting vertical sensor offset in image1...")
-    img1_corrected = apply_vertical_offset(img1, x_end + 1, v_offset)
+    img1_corrected = apply_vertical_offset(img1, x_start, v_offset)
 
     print("Aligning image2 onto image1's frame...")
     warped2 = align_to_base(img1_corrected, img2_oriented)
@@ -441,11 +440,8 @@ def main():
         else:
             print(f"  image2's own line at columns {line2_in_warped[0]}-{line2_in_warped[1]} (no overlap, good)")
 
-    print("Applying local optical-flow warp to patch region...")
-    warped2_local = local_warp_patch(img1_corrected, warped2, x_start, x_end)
-
     print("Matching local tone of patch to surrounding image...")
-    warped2_toned = match_local_tone(img1_corrected, warped2_local, x_start, x_end)
+    warped2_toned = match_local_tone(img1_corrected, warped2, x_start, x_end)
 
     print("Blending with feather...")
     result = feather_patch(img1_corrected, warped2_toned, x_start, x_end, feather=args.feather)
@@ -459,7 +455,6 @@ def main():
             img1,
             img1_corrected,
             warped2,
-            warped2_local,
             warped2_toned,
             result,
         )
