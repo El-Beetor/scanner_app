@@ -10,23 +10,28 @@ in scan 1 is clean in scan 2), the script:
   1. Aligns the two scans precisely (ORB feature matching + homography).
   2. Refines local alignment around the artifact using dense optical flow.
   3. Corrects a fixed vertical pixel offset between the scanner's left and right
-     sensor halves (a hardware constant -- calibrate once with --calibrate,
-     saved to scanner_config.json and applied automatically on every future run).
+     sensor halves.
   4. Matches local brightness/contrast of the patch to surrounding columns.
   5. Feathers the patch into the base image.
 
-Usage:
-    # First-time calibration (measure and save the sensor offset):
-    python3 stitch_remove_scanline.py img1.jpg img2.jpg --calibrate
+Both the artifact line position and the vertical sensor offset are hardware
+constants for a given DPI setting. Calibrate once per DPI with --calibrate
+and they are saved to scanner_config.json and used automatically from then on.
 
-    # Normal use:
+Usage:
+    # First-time setup for a given DPI (e.g. 600dpi):
+    python3 stitch_remove_scanline.py img1.jpg --calibrate --dpi 600
+    python3 stitch_remove_scanline.py img1.jpg --calibrate --dpi 600 --vertical-offset 3
+
+    # Normal use (DPI is read from image EXIF, or pass --dpi explicitly):
     python3 stitch_remove_scanline.py img1.jpg img2.jpg -o result.jpg
 
     Optional flags:
+      --dpi N                       DPI profile to use (default: read from EXIF)
       --rotate-deg {0,90,180,270}   rotation to apply to img2 (default 0)
       --feather N                   blend-feather width in px (default 40)
       --vertical-offset N           override saved sensor offset in pixels
-      --calibrate                   measure offset, save to scanner_config.json, exit
+      --calibrate                   detect line + save config for this DPI, then exit
       --debug                       save extra debug images
 """
 
@@ -47,6 +52,23 @@ def load_image(path):
     return img
 
 
+def read_exif_dpi(path):
+    """Return DPI from EXIF as an int, or None if unavailable."""
+    try:
+        import struct
+        with open(path, "rb") as f:
+            data = f.read(65536)
+        # Look for JFIF APP0 (DPI stored there)
+        if data[6:10] == b"JFIF":
+            units = data[13]
+            x_density = struct.unpack(">H", data[14:16])[0]
+            if units in (1, 2) and x_density > 0:
+                return x_density if units == 1 else round(x_density * 2.54)
+    except Exception:
+        pass
+    return None
+
+
 def load_config():
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH) as f:
@@ -58,6 +80,10 @@ def save_config(cfg):
     with open(CONFIG_PATH, "w") as f:
         json.dump(cfg, f, indent=2)
     print(f"  Saved to {CONFIG_PATH}")
+
+
+def dpi_key(dpi):
+    return f"dpi_{dpi}"
 
 
 def detect_blue_line(img, min_strength=500, max_width=500):
@@ -100,7 +126,6 @@ def measure_vertical_offset(img, x_line_start, x_line_end, sample_width=150, sam
     """
     Measures the vertical pixel offset between the scanner's left and right
     sensor halves by cross-correlating strips on each side of the blue line.
-
     Returns offset in pixels (positive = right side is shifted downward).
     """
     h, w = img.shape[:2]
@@ -117,7 +142,6 @@ def measure_vertical_offset(img, x_line_start, x_line_end, sample_width=150, sam
     left_strip = cv2.cvtColor(img[y0:y1, lx0:lx1], cv2.COLOR_BGR2GRAY).astype(np.float32)
     right_strip = cv2.cvtColor(img[y0:y1, rx0:rx1], cv2.COLOR_BGR2GRAY).astype(np.float32)
 
-    # Resize to same width if strips differ
     if left_strip.shape[1] != right_strip.shape[1]:
         w_min = min(left_strip.shape[1], right_strip.shape[1])
         left_strip = left_strip[:, :w_min]
@@ -125,15 +149,15 @@ def measure_vertical_offset(img, x_line_start, x_line_end, sample_width=150, sam
 
     shift, _ = cv2.phaseCorrelate(left_strip, right_strip)
     vertical_offset = round(shift[1])
-    print(f"  measured vertical offset: {vertical_offset}px (right side shifted {'down' if vertical_offset > 0 else 'up'})")
+    print(f"  measured vertical offset: {vertical_offset}px "
+          f"(right side shifted {'down' if vertical_offset > 0 else 'up'})")
     return vertical_offset
 
 
 def apply_vertical_offset(img, x_split, offset):
     """
     Corrects the scanner's inter-sensor vertical offset by shifting everything
-    to the right of x_split upward (if offset > 0) or downward (if offset < 0).
-    The gap introduced at the edge is filled by replicating the border row.
+    to the right of x_split up or down by |offset| pixels.
     """
     if offset == 0:
         return img
@@ -143,11 +167,9 @@ def apply_vertical_offset(img, x_split, offset):
     h = right.shape[0]
 
     if offset > 0:
-        # right side is too low — shift it up
         result[:h - offset, x_split:] = right[offset:, :]
         result[h - offset:, x_split:] = right[-1:, :]
     else:
-        # right side is too high — shift it down
         o = -offset
         result[o:, x_split:] = right[:h - o, :]
         result[:o, x_split:] = right[:1, :]
@@ -264,93 +286,141 @@ def feather_patch(base, patch, x_start, x_end, feather=40):
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+def resolve_dpi(args, img_path):
+    """Return the DPI to use: explicit flag > EXIF > fallback 'default'."""
+    if args.dpi:
+        return str(args.dpi)
+    dpi = read_exif_dpi(img_path)
+    if dpi:
+        print(f"  DPI from EXIF: {dpi}")
+        return str(dpi)
+    print("  WARNING: could not read DPI from EXIF. Using profile 'default'. "
+          "Pass --dpi N if you have multiple DPI profiles.")
+    return "default"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("image1", help="first scan (base orientation)")
-    ap.add_argument("image2", help="second scan (shifted slightly to cover the artifact)")
+    ap.add_argument("image2", nargs="?", help="second scan (shifted to cover the artifact); not needed for --calibrate")
     ap.add_argument("-o", "--output", default="stitched_result.jpg")
+    ap.add_argument("--dpi", type=int, default=None,
+                    help="DPI profile to use (default: read from image EXIF)")
     ap.add_argument("--rotate-deg", type=int, choices=[0, 90, 180, 270], default=0)
     ap.add_argument("--feather", type=int, default=40)
     ap.add_argument("--vertical-offset", type=int, default=None,
                     help="override saved sensor offset (pixels, positive = right side too low)")
     ap.add_argument("--calibrate", action="store_true",
-                    help="measure vertical sensor offset, save to scanner_config.json, and exit")
+                    help="detect line position + save config for this DPI, then exit")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
     img1 = load_image(args.image1)
+    cfg = load_config()
+    dpi = resolve_dpi(args, args.image1)
+    profile = cfg.get(dpi_key(dpi), {})
 
-    print("Detecting artifact line in image1...")
-    line1 = detect_blue_line(img1)
-    if line1 is None:
-        sys.exit("ERROR: could not detect a blue artifact line in image1")
-    print(f"  found at columns {line1[0]}-{line1[1]} (width {line1[1]-line1[0]+1}px)")
-
+    # ── CALIBRATION MODE ────────────────────────────────────────────────────
     if args.calibrate:
-        if args.vertical_offset is not None:
-            offset = args.vertical_offset
-            print(f"Saving manually specified vertical offset: {offset}px")
+        # Line position
+        if "line_start" in profile and "line_end" in profile and args.vertical_offset is None:
+            # Already have line; just update vertical offset if provided
+            x_start, x_end = profile["line_start"], profile["line_end"]
+            print(f"Using saved line position: columns {x_start}-{x_end}")
         else:
-            print("Calibrating vertical sensor offset automatically...")
-            offset = measure_vertical_offset(img1, line1[0], line1[1])
-            print("  NOTE: auto-measurement may be unreliable if left/right content differs.")
-            print("  If the result looks wrong, re-run with --calibrate --vertical-offset N")
-        cfg = load_config()
-        cfg["vertical_offset"] = offset
+            print("Detecting artifact line...")
+            line = detect_blue_line(img1)
+            if line is None:
+                sys.exit("ERROR: could not detect a blue artifact line in image1")
+            x_start, x_end = line
+            print(f"  found at columns {x_start}-{x_end} (width {x_end-x_start+1}px)")
+
+        # Vertical offset
+        if args.vertical_offset is not None:
+            v_offset = args.vertical_offset
+            print(f"Saving manually specified vertical offset: {v_offset}px")
+        else:
+            print("Measuring vertical sensor offset automatically...")
+            v_offset = measure_vertical_offset(img1, x_start, x_end)
+            print("  NOTE: auto-measurement may be unreliable if content differs across the line.")
+            print("  If wrong, re-run: --calibrate --vertical-offset N")
+
+        profile["line_start"] = x_start
+        profile["line_end"] = x_end
+        profile["vertical_offset"] = v_offset
+        cfg[dpi_key(dpi)] = profile
         save_config(cfg)
-        print(f"Calibration complete. vertical_offset={offset}px saved to scanner_config.json.")
+        print(f"Calibration saved for DPI profile '{dpi}': "
+              f"line={x_start}-{x_end}, vertical_offset={v_offset}px")
         return
 
-    img2 = load_image(args.image2)
+    # ── NORMAL MODE ─────────────────────────────────────────────────────────
+    if args.image2 is None:
+        ap.error("image2 is required for normal (non-calibrate) use")
 
-    rot_map = {0: None, 90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+    # Resolve line position
+    if "line_start" in profile and "line_end" in profile:
+        x_start, x_end = profile["line_start"], profile["line_end"]
+        print(f"Using saved line position for DPI '{dpi}': columns {x_start}-{x_end} "
+              f"(width {x_end-x_start+1}px)")
+    else:
+        print(f"No saved line position for DPI '{dpi}'. Detecting...")
+        line = detect_blue_line(img1)
+        if line is None:
+            sys.exit("ERROR: could not detect a blue artifact line. "
+                     "Run with --calibrate first, or check --dpi value.")
+        x_start, x_end = line
+        print(f"  found at columns {x_start}-{x_end} (width {x_end-x_start+1}px)")
+        print("  Tip: run --calibrate to save this so detection is skipped next time.")
+
+    # Resolve vertical offset
+    if args.vertical_offset is not None:
+        v_offset = args.vertical_offset
+        print(f"Using vertical offset from --vertical-offset flag: {v_offset}px")
+    elif "vertical_offset" in profile:
+        v_offset = profile["vertical_offset"]
+        print(f"Using saved vertical offset for DPI '{dpi}': {v_offset}px")
+    else:
+        print("No saved vertical offset. Run --calibrate --vertical-offset N to set it.")
+        v_offset = 0
+
+    img2 = load_image(args.image2)
+    rot_map = {0: None, 90: cv2.ROTATE_90_CLOCKWISE,
+               180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
     img2_oriented = img2 if rot_map[args.rotate_deg] is None else cv2.rotate(img2, rot_map[args.rotate_deg])
     if img2_oriented.shape[:2] != img1.shape[:2]:
         img2_oriented = cv2.resize(img2_oriented, (img1.shape[1], img1.shape[0]))
 
-    # Determine vertical offset to use
-    if args.vertical_offset is not None:
-        v_offset = args.vertical_offset
-        print(f"Using vertical offset from --vertical-offset flag: {v_offset}px")
-    else:
-        cfg = load_config()
-        if "vertical_offset" in cfg:
-            v_offset = cfg["vertical_offset"]
-            print(f"Using saved vertical offset: {v_offset}px")
-        else:
-            print("No saved vertical offset found. Run with --calibrate first, or pass --vertical-offset N.")
-            v_offset = 0
-
     print("Correcting vertical sensor offset in image1...")
-    img1_corrected = apply_vertical_offset(img1, line1[1] + 1, v_offset)
+    img1_corrected = apply_vertical_offset(img1, x_end + 1, v_offset)
 
     print("Aligning image2 onto image1's frame...")
     warped2 = align_to_base(img1_corrected, img2_oriented)
 
     line2_in_warped = detect_blue_line(warped2)
     if line2_in_warped is not None:
-        overlap = not (line2_in_warped[1] < line1[0] or line2_in_warped[0] > line1[1])
+        overlap = not (line2_in_warped[1] < x_start or line2_in_warped[0] > x_end)
         if overlap:
             print("  WARNING: image2's artifact line overlaps image1's -- patch may be incomplete")
         else:
             print(f"  image2's own line at columns {line2_in_warped[0]}-{line2_in_warped[1]} (no overlap, good)")
 
     print("Applying local optical-flow warp to patch region...")
-    warped2_local = local_warp_patch(img1_corrected, warped2, line1[0], line1[1])
+    warped2_local = local_warp_patch(img1_corrected, warped2, x_start, x_end)
 
     print("Matching local tone of patch to surrounding image...")
-    warped2_toned = match_local_tone(img1_corrected, warped2_local, line1[0], line1[1])
+    warped2_toned = match_local_tone(img1_corrected, warped2_local, x_start, x_end)
 
     print("Blending with feather...")
-    result = feather_patch(img1_corrected, warped2_toned, line1[0], line1[1], feather=args.feather)
+    result = feather_patch(img1_corrected, warped2_toned, x_start, x_end, feather=args.feather)
 
     cv2.imwrite(args.output, result)
     print(f"Saved result: {args.output}")
 
     if args.debug:
         debug = img1_corrected.copy()
-        cv2.rectangle(debug, (line1[0], 0), (line1[1], debug.shape[0] - 1), (0, 0, 255), 3)
+        cv2.rectangle(debug, (x_start, 0), (x_end, debug.shape[0] - 1), (0, 0, 255), 3)
         cv2.imwrite("debug_detected_line.jpg", debug)
         cv2.imwrite("debug_corrected_base.jpg", img1_corrected)
         cv2.imwrite("debug_warped_image2.jpg", warped2)

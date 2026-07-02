@@ -1,3 +1,8 @@
 {
-  "vertical_offset": 0
+  "vertical_offset": 0,
+  "dpi_600": {
+    "line_start": 942,
+    "line_end": 1255,
+    "vertical_offset": 0
+  }
 }
