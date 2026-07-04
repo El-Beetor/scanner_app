@@ -338,7 +338,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("image1", help="first scan (base orientation)")
     ap.add_argument("image2", nargs="?", help="second scan (shifted to cover the artifact); not needed for --calibrate")
-    ap.add_argument("-o", "--output", default="stitched_result.jpg")
+    ap.add_argument("-o", "--output", default="stitched_result.png")
     ap.add_argument("--dpi", type=int, default=None,
                     help="DPI profile to use (default: read from image EXIF)")
     ap.add_argument("--rotate-deg", type=int, choices=[0, 90, 180, 270], default=0)

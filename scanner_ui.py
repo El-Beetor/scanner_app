@@ -152,7 +152,7 @@ class App(TkinterDnD.Tk):
 
         tk.Label(opts, text="Output:", bg=BG, fg=TEXT,
                  font=("Helvetica", 12)).grid(row=0, column=2, sticky="w")
-        self.out_var = tk.StringVar(value="stitched_result.jpg")
+        self.out_var = tk.StringVar(value="stitched_result.png")
         tk.Entry(opts, textvariable=self.out_var, bg=PANEL, fg=TEXT,
                  insertbackground=TEXT, font=("Helvetica", 12),
                  relief="flat", width=32).grid(row=0, column=3, padx=(6, 4))
@@ -178,7 +178,7 @@ class App(TkinterDnD.Tk):
         self.bar.pack(fill="x", pady=(6, 0))
 
     def _on_img1(self, path):
-        default_out = os.path.join(os.path.dirname(path), "stitched_result.jpg")
+        default_out = os.path.join(os.path.dirname(path), "stitched_result.png")
         self.out_var.set(default_out)
 
     def _on_img2(self, _):
@@ -186,8 +186,8 @@ class App(TkinterDnD.Tk):
 
     def _pick_out(self):
         p = filedialog.asksaveasfilename(
-            defaultextension=".jpg",
-            filetypes=[("JPEG", "*.jpg"), ("PNG", "*.png"), ("All", "*.*")])
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg"), ("All", "*.*")])
         if p:
             self.out_var.set(p)
 
