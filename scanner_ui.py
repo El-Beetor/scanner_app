@@ -178,7 +178,8 @@ class App(TkinterDnD.Tk):
         self.bar.pack(fill="x", pady=(6, 0))
 
     def _on_img1(self, path):
-        default_out = os.path.join(os.path.dirname(path), "stitched_result.png")
+        base = os.path.splitext(os.path.basename(path))[0]
+        default_out = os.path.join(os.path.dirname(path), f"{base}_stitched.png")
         self.out_var.set(default_out)
 
     def _on_img2(self, _):
