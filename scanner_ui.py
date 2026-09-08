@@ -183,10 +183,17 @@ class App(TkinterDnD.Tk):
         default_out = os.path.join(os.path.dirname(path), f"{base}_stitched.png")
         self.out_var.set(default_out)
         self._select_dpi_for(path)
+        self._check_pair_dpi()
 
     def _on_img2(self, path):
-        d1 = pipeline.read_exif_dpi(self.z1.path) if self.z1.path else None
-        d2 = pipeline.read_exif_dpi(path)
+        self._check_pair_dpi()
+
+    def _check_pair_dpi(self):
+        """Warn when the two dropped scans disagree on DPI, whichever was dropped last."""
+        if not (self.z1.path and self.z2.path):
+            return
+        d1 = pipeline.read_exif_dpi(self.z1.path)
+        d2 = pipeline.read_exif_dpi(self.z2.path)
         if d1 and d2 and d1 != d2:
             self._set_status(f"⚠ Scan 1 is {d1}dpi but Scan 2 is {d2}dpi — rescan at the same DPI")
 
@@ -233,15 +240,19 @@ class App(TkinterDnD.Tk):
                                          dpi=dpi_str, log=self._log)
             steps = (f"step: scan 1 {info['vertical_offset']:+d}px, "
                      f"scan 2 {info['vertical_offset_scan2']:+d}px")
-            self._set_status(f"Done  ✓  {os.path.basename(info['output'])}  —  {steps}",
-                             done=True, path=info["output"])
+            name = os.path.basename(info["output"])
+            if info["warnings"]:
+                self._set_status(f"Done with warnings  ⚠  {name}  —  {steps}",
+                                 done=True, path=info["output"], warnings=info["warnings"])
+            else:
+                self._set_status(f"Done  ✓  {name}  —  {steps}", done=True, path=info["output"])
         except Exception as exc:
             self._set_status(f"Error: {exc}", error=True)
 
     def _log(self, msg):
         self._set_status(msg.strip())
 
-    def _set_status(self, msg, done=False, error=False, path=None):
+    def _set_status(self, msg, done=False, error=False, path=None, warnings=None):
         def _update():
             self.status_var.set(msg)
             if done or error:
@@ -249,6 +260,12 @@ class App(TkinterDnD.Tk):
                 self.bar["value"] = 0
                 self.run_btn.config(state="normal")
             if done and path:
+                if warnings:
+                    # Each pipeline line replaces the status text, so warnings would
+                    # otherwise be gone by the time the run finishes.
+                    messagebox.showwarning(
+                        "Finished with warnings",
+                        "\n\n".join(f"• {w}" for w in warnings) + f"\n\nSaved to:\n{path}")
                 if messagebox.askyesno("Done!", f"Saved to:\n{path}\n\nReveal in Finder?"):
                     subprocess.run(["open", "-R", path])
         self.after(0, _update)
