@@ -7,3 +7,9 @@ venv/
 .DS_Store
 Thumbs.db
 .pytest_cache/
+
+# stitch outputs and --debug images (scanner_config.json stays tracked: it is the calibration)
+debug_*.jpg
+*_stitched.png
+stitched_*.png
+stitched_*.jpg
