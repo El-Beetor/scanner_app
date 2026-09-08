@@ -253,18 +253,15 @@ def apply_vertical_offset(img, x_split, offset):
     if offset == 0:
         return img
 
-    result = img.copy()
-    right = img[:, x_split:].copy()
-    h = right.shape[0]
-
-    if offset > 0:
-        result[:h - offset, x_split:] = right[offset:, :]
-        result[h - offset:, x_split:] = right[-1:, :]
-    else:
+    h = img.shape[0]
+    result = img.copy()                      # reads come from img, so no aliasing
+    if offset > 0:                           # right side sits too low: move it up
+        result[:h - offset, x_split:] = img[offset:, x_split:]
+        result[h - offset:, x_split:] = img[-1:, x_split:]
+    else:                                    # right side sits too high: move it down
         o = -offset
-        result[o:, x_split:] = right[:h - o, :]
-        result[:o, x_split:] = right[:1, :]
-
+        result[o:, x_split:] = img[:h - o, x_split:]
+        result[:o, x_split:] = img[:1, x_split:]
     return result
 
 
@@ -317,39 +314,46 @@ def match_local_tone(base, patch, x_start, x_end, context_width=60):
 
     patch_cols = patch[:, x_start:x_end + 1].reshape(-1, 3).astype(np.float32)
 
-    adjusted = patch.astype(np.float32).copy()
+    # Only the artifact columns change, so only they are taken to float.
+    roi = patch[:, x_start:x_end + 1].astype(np.float32)
     for c in range(3):
         ref_mean, ref_std = ref_cols[:, c].mean(), ref_cols[:, c].std() + 1e-6
         src_mean, src_std = patch_cols[:, c].mean(), patch_cols[:, c].std() + 1e-6
         scale = ref_std / src_std
         shift_val = ref_mean - src_mean * scale
-        adjusted[:, x_start:x_end + 1, c] = (
-            patch[:, x_start:x_end + 1, c].astype(np.float32) * scale + shift_val
-        )
+        roi[:, :, c] = patch[:, x_start:x_end + 1, c].astype(np.float32) * scale + shift_val
 
-    return np.clip(adjusted, 0, 255).astype(np.uint8)
+    out = patch.copy()
+    out[:, x_start:x_end + 1] = np.clip(roi, 0, 255).astype(np.uint8)
+    return out
 
 
 def feather_patch(base, patch, x_start, x_end, feather=40):
     """Replace columns [x_start, x_end] of base with patch, ramping alpha over
     `feather` px on each side so there is no hard seam."""
-    out = base.astype(np.float32).copy()
-    patch_f = patch.astype(np.float32)
     h, w = base.shape[:2]
-
     fx_start = max(0, x_start - feather)
     fx_end = min(w - 1, x_end + feather)
 
-    for x in range(fx_start, fx_end + 1):
+    def alpha_at(x):
         if x < x_start:
-            alpha = (x - fx_start) / max(1, (x_start - fx_start))
-        elif x > x_end:
-            alpha = 1 - (x - x_end) / max(1, (fx_end - x_end))
-        else:
-            alpha = 1.0
-        out[:, x] = (1 - alpha) * out[:, x] + alpha * patch_f[:, x]
+            return (x - fx_start) / max(1, (x_start - fx_start))
+        if x > x_end:
+            return 1 - (x - x_end) / max(1, (fx_end - x_end))
+        return 1.0
 
-    return np.clip(out, 0, 255).astype(np.uint8)
+    # Only the feather window [fx_start, fx_end] changes, so only it is taken to
+    # float (the full image would be ~1.7 GB per copy at 1200dpi).
+    alpha = np.array([alpha_at(x) for x in range(fx_start, fx_end + 1)])
+    a = alpha.astype(np.float32)[None, :, None]
+    b = (1 - alpha).astype(np.float32)[None, :, None]
+    base_f = base[:, fx_start:fx_end + 1].astype(np.float32)
+    patch_f = patch[:, fx_start:fx_end + 1].astype(np.float32)
+    blended = b * base_f + a * patch_f
+
+    out = base.copy()
+    out[:, fx_start:fx_end + 1] = np.clip(blended, 0, 255).astype(np.uint8)
+    return out
 
 
 def save_debug_steps(out_dir, x_start, x_end, steps, log=print):
@@ -485,6 +489,7 @@ def run_pipeline(image1, image2, output, dpi=None, vertical_offset=None, feather
 
     log("Aligning image2 onto image1's frame...")
     warped2 = align_to_base(img1_corrected, img2_corrected, log=log)
+    del img2, img2_oriented, img2_corrected      # ~0.4 GB each at 1200dpi; no longer needed
 
     line2_in_warped = detect_blue_line(warped2)
     if line2_in_warped is not None:
