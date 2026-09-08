@@ -13,7 +13,6 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-import cv2
 from PIL import Image, ImageTk
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
@@ -207,44 +206,15 @@ class App(TkinterDnD.Tk):
     # ── Pipeline (runs in background thread) ─────────────────────────────────
     def _pipeline(self, img1_path, img2_path, output, dpi_str):
         try:
-            self._set_status("Loading images…")
-            img1 = pipeline.load_image(img1_path)
-            img2 = pipeline.load_image(img2_path)
-
-            cfg     = pipeline.load_config()
-            profile = cfg.get(pipeline.dpi_key(dpi_str), {})
-
-            # Line position — always use saved calibration, never auto-detect
-            if "line_start" in profile and "line_end" in profile:
-                x_start, x_end = profile["line_start"], profile["line_end"]
-                self._set_status(f"Using saved line: cols {x_start}–{x_end}")
-            else:
-                raise RuntimeError(
-                    f"No calibration found for DPI '{dpi_str}'.\n"
-                    f"Run:  python3 stitch_remove_scanline.py img1.jpg --calibrate --dpi {dpi_str}"
-                )
-
-            v_offset = profile.get("vertical_offset", 0)
-
-            self._set_status(f"Correcting {v_offset}px vertical sensor offset…")
-            img1c = pipeline.apply_vertical_offset(img1, x_start, v_offset)
-
-            self._set_status("Aligning scan 2 to scan 1…")
-            if img2.shape[:2] != img1c.shape[:2]:
-                img2 = cv2.resize(img2, (img1c.shape[1], img1c.shape[0]))
-            warped = pipeline.align_to_base(img1c, img2)
-
-            self._set_status("Matching tone…")
-            toned = pipeline.match_local_tone(img1c, warped, x_start, x_end)
-
-            self._set_status("Blending…")
-            result = pipeline.feather_patch(img1c, toned, x_start, x_end)
-
-            cv2.imwrite(output, result)
-            self._set_status(f"Done  ✓  {os.path.basename(output)}", done=True, path=output)
-
+            info = pipeline.run_pipeline(img1_path, img2_path, output,
+                                         dpi=dpi_str, log=self._log)
+            self._set_status(f"Done  ✓  {os.path.basename(info['output'])}",
+                             done=True, path=info["output"])
         except Exception as exc:
             self._set_status(f"Error: {exc}", error=True)
+
+    def _log(self, msg):
+        self._set_status(msg.strip())
 
     def _set_status(self, msg, done=False, error=False, path=None):
         def _update():
