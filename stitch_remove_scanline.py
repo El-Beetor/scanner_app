@@ -92,16 +92,31 @@ def dpi_key(dpi):
 
 
 def resolve_dpi(dpi, image_path, log=print):
-    """Return the DPI profile name to use: explicit value > file header > 'default'."""
+    """Return the DPI profile name to use: the explicit value, else the file's header."""
     if dpi:
         return str(dpi)
     found = read_exif_dpi(image_path)
     if found:
         log(f"  DPI from file header: {found}")
         return str(found)
-    log("  WARNING: could not read DPI from file header. Using profile 'default'. "
-        "Pass --dpi N if you have multiple DPI profiles.")
-    return "default"
+    raise PipelineError(
+        f"could not read the DPI from {os.path.basename(image_path)}'s header; pass --dpi N")
+
+
+def check_dpi_matches(image_path, img, dpi, profile):
+    """Raise if the file's header DPI or its pixel width contradict the chosen profile.
+    Guards against running a 1200dpi scan through the 600dpi line position (which
+    would patch the wrong columns and leave the real line untouched)."""
+    name = os.path.basename(image_path)
+    hdr = read_exif_dpi(image_path)
+    if hdr and str(hdr) != str(dpi):
+        raise PipelineError(
+            f"{name} header says {hdr}dpi but the {dpi}dpi profile was selected")
+    expected = profile.get("image_width")
+    if expected and img.shape[1] != expected:
+        raise PipelineError(
+            f"{name} is {img.shape[1]}px wide but the {dpi}dpi profile expects "
+            f"{expected}px — wrong DPI selected?")
 
 
 # ── Detection and calibration measurements ────────────────────────────────────
@@ -316,6 +331,7 @@ def calibrate(image1, dpi=None, vertical_offset=None, config_path=CONFIG_PATH, l
     cfg = load_config(config_path)
     dpi = resolve_dpi(dpi, image1, log)
     profile = cfg.get(dpi_key(dpi), {})
+    check_dpi_matches(image1, img1, dpi, profile)
 
     if "line_start" in profile and "line_end" in profile and vertical_offset is None:
         x_start, x_end = profile["line_start"], profile["line_end"]
@@ -340,10 +356,11 @@ def calibrate(image1, dpi=None, vertical_offset=None, config_path=CONFIG_PATH, l
     profile["line_start"] = x_start
     profile["line_end"] = x_end
     profile["vertical_offset"] = v_offset
+    profile["image_width"] = img1.shape[1]
     cfg[dpi_key(dpi)] = profile
     save_config(cfg, config_path, log)
     log(f"Calibration saved for DPI profile '{dpi}': "
-        f"line={x_start}-{x_end}, vertical_offset={v_offset}px")
+        f"line={x_start}-{x_end}, vertical_offset={v_offset}px, image_width={img1.shape[1]}px")
     return profile
 
 
@@ -384,12 +401,20 @@ def run_pipeline(image1, image2, output, dpi=None, vertical_offset=None, feather
         log("No saved vertical offset. Run --calibrate --vertical-offset N to set it.")
         v_offset = 0
 
+    check_dpi_matches(image1, img1, dpi, profile)
+
     img2 = load_image(image2)
     rot_map = {0: None, 90: cv2.ROTATE_90_CLOCKWISE,
                180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
     img2_oriented = img2 if rot_map[rotate_deg] is None else cv2.rotate(img2, rot_map[rotate_deg])
+    check_dpi_matches(image2, img2_oriented, dpi, profile)
     if img2_oriented.shape[:2] != img1.shape[:2]:
-        img2_oriented = cv2.resize(img2_oriented, (img1.shape[1], img1.shape[0]))
+        # Same scanner + same DPI + same scan area always gives identical sizes;
+        # anything else means the line column is wrong too, so don't resize-and-hope.
+        raise PipelineError(
+            f"scan sizes differ: {os.path.basename(image1)} is {img1.shape[1]}x{img1.shape[0]}, "
+            f"{os.path.basename(image2)} is {img2_oriented.shape[1]}x{img2_oriented.shape[0]} — "
+            "both scans must use the same DPI and scan area")
 
     log("Correcting vertical sensor offset in image1...")
     img1_corrected = apply_vertical_offset(img1, x_start, v_offset)

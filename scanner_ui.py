@@ -145,9 +145,11 @@ class App(TkinterDnD.Tk):
 
         cfg = pipeline.load_config()
         dpi_choices = [k.replace("dpi_", "") for k in cfg if k.startswith("dpi_")] or ["600"]
+        self.dpi_choices = dpi_choices
         self.dpi_var = tk.StringVar(value=dpi_choices[0])
-        ttk.Combobox(opts, textvariable=self.dpi_var, values=dpi_choices,
-                     width=7, state="readonly").grid(row=0, column=1, padx=(6, 28), sticky="w")
+        self.dpi_box = ttk.Combobox(opts, textvariable=self.dpi_var, values=dpi_choices,
+                                    width=7, state="readonly")
+        self.dpi_box.grid(row=0, column=1, padx=(6, 28), sticky="w")
 
         tk.Label(opts, text="Output:", bg=BG, fg=TEXT,
                  font=("Helvetica", 12)).grid(row=0, column=2, sticky="w")
@@ -180,9 +182,30 @@ class App(TkinterDnD.Tk):
         base = os.path.splitext(os.path.basename(path))[0]
         default_out = os.path.join(os.path.dirname(path), f"{base}_stitched.png")
         self.out_var.set(default_out)
+        self._select_dpi_for(path)
 
-    def _on_img2(self, _):
-        pass
+    def _on_img2(self, path):
+        d1 = pipeline.read_exif_dpi(self.z1.path) if self.z1.path else None
+        d2 = pipeline.read_exif_dpi(path)
+        if d1 and d2 and d1 != d2:
+            self._set_status(f"⚠ Scan 1 is {d1}dpi but Scan 2 is {d2}dpi — rescan at the same DPI")
+
+    def _select_dpi_for(self, path):
+        """Select the DPI profile matching the file's header; list it (with a warning)
+        if there is no calibration for it yet."""
+        dpi = pipeline.read_exif_dpi(path)
+        if not dpi:
+            self._set_status("Could not read DPI from file — check the DPI dropdown")
+            return
+        dpi = str(dpi)
+        if dpi not in self.dpi_choices:
+            self.dpi_choices.append(dpi)
+            self.dpi_box["values"] = self.dpi_choices
+            self._set_status(f"Scan is {dpi}dpi — no calibration for it yet "
+                             f"(run: stitch_remove_scanline.py scan.jpg --calibrate --dpi {dpi})")
+        else:
+            self._set_status(f"Scan is {dpi}dpi — profile selected")
+        self.dpi_var.set(dpi)
 
     def _pick_out(self):
         p = filedialog.asksaveasfilename(
