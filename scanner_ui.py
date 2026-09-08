@@ -231,7 +231,9 @@ class App(TkinterDnD.Tk):
         try:
             info = pipeline.run_pipeline(img1_path, img2_path, output,
                                          dpi=dpi_str, log=self._log)
-            self._set_status(f"Done  ✓  {os.path.basename(info['output'])}",
+            steps = (f"step: scan 1 {info['vertical_offset']:+d}px, "
+                     f"scan 2 {info['vertical_offset_scan2']:+d}px")
+            self._set_status(f"Done  ✓  {os.path.basename(info['output'])}  —  {steps}",
                              done=True, path=info["output"])
         except Exception as exc:
             self._set_status(f"Error: {exc}", error=True)
