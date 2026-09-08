@@ -267,7 +267,8 @@ def apply_vertical_offset(img, x_split, offset):
 
 def align_to_base(base_img, moving_img, min_matches=15, log=print):
     """Warp moving_img onto base_img's frame (ORB + RANSAC homography, with a
-    phase-correlation translation fallback)."""
+    phase-correlation translation fallback). Returns (warped, H) where H is the
+    3x3 matrix mapping moving_img coordinates to base_img coordinates."""
     h, w = base_img.shape[:2]
     gray_base = cv2.cvtColor(base_img, cv2.COLOR_BGR2GRAY)
     gray_moving = cv2.cvtColor(moving_img, cv2.COLOR_BGR2GRAY)
@@ -289,7 +290,7 @@ def align_to_base(base_img, moving_img, min_matches=15, log=print):
             if H is not None:
                 inliers = int(mask.sum()) if mask is not None else 0
                 log(f"  homography alignment: {inliers}/{len(good)} inlier matches")
-                return cv2.warpPerspective(moving_img, H, (w, h))
+                return cv2.warpPerspective(moving_img, H, (w, h)), H
 
     log("  WARNING: feature-based alignment failed, falling back to translation-only")
     shift, response = cv2.phaseCorrelate(
@@ -297,7 +298,17 @@ def align_to_base(base_img, moving_img, min_matches=15, log=print):
     )
     log(f"  translation fallback: shift={shift}, confidence={response:.2f}")
     M = np.array([[1, 0, shift[0]], [0, 1, shift[1]]], dtype=np.float32)
-    return cv2.warpAffine(moving_img, M, (w, h))
+    H = np.vstack([M, [0, 0, 1]]).astype(np.float64)
+    return cv2.warpAffine(moving_img, M, (w, h)), H
+
+
+def warped_line_columns(H, x_start, x_end, height):
+    """Column range scan 2's artifact line occupies after warping by H, sampled
+    down the full height since H may carry a slight rotation."""
+    ys = np.linspace(0, height - 1, 25)
+    pts = np.array([[x, y] for x in (x_start, x_end) for y in ys], dtype=np.float64)
+    xs = cv2.perspectiveTransform(pts.reshape(-1, 1, 2), H)[:, 0, 0]
+    return int(np.floor(xs.min())), int(np.ceil(xs.max()))
 
 
 def match_local_tone(base, patch, x_start, x_end, context_width=60):
@@ -488,16 +499,20 @@ def run_pipeline(image1, image2, output, dpi=None, vertical_offset=None, feather
     img2_corrected = apply_vertical_offset(img2_oriented, x_start, v2)
 
     log("Aligning image2 onto image1's frame...")
-    warped2 = align_to_base(img1_corrected, img2_corrected, log=log)
+    warped2, H = align_to_base(img1_corrected, img2_corrected, log=log)
     del img2, img2_oriented, img2_corrected      # ~0.4 GB each at 1200dpi; no longer needed
 
-    line2_in_warped = detect_blue_line(warped2)
-    if line2_in_warped is not None:
-        overlap = not (line2_in_warped[1] < x_start or line2_in_warped[0] > x_end)
-        if overlap:
-            log("  WARNING: image2's artifact line overlaps image1's -- patch may be incomplete")
+    # Scan 2's own artifact sits at the same column in its own frame. See where the
+    # alignment put it and make sure it is clear of the window the patch comes from.
+    if rotate_deg == 0:
+        l2_start, l2_end = warped_line_columns(H, x_start, x_end, img1.shape[0])
+        patch_lo, patch_hi = x_start - feather, x_end + feather
+        if l2_end >= patch_lo and l2_start <= patch_hi:
+            log(f"  WARNING: scan 2's own artifact line lands at columns {l2_start}-{l2_end}, "
+                f"inside the {patch_lo}-{patch_hi} window the patch is taken from — "
+                "the artifact will remain; shift scan 2 further next time")
         else:
-            log(f"  image2's own line at columns {line2_in_warped[0]}-{line2_in_warped[1]} (no overlap, good)")
+            log(f"  scan 2's own line lands at columns {l2_start}-{l2_end} (clear of the patch window)")
 
     log("Matching local tone of patch to surrounding image...")
     warped2_toned = match_local_tone(img1_corrected, warped2, x_start, x_end)
