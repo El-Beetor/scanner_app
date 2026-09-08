@@ -2,11 +2,13 @@
   "dpi_600": {
     "line_start": 2714,
     "line_end": 2738,
-    "vertical_offset": 5
+    "vertical_offset": 5,
+    "image_width": 5100
   },
   "dpi_1200": {
     "line_start": 5426,
     "line_end": 5468,
-    "vertical_offset": 0
+    "vertical_offset": 0,
+    "image_width": 10200
   }
 }

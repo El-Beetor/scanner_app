@@ -1,81 +1,115 @@
-# scan-line-fix
+# scanner_app — remove a fixed-column scanner artifact
 
-Removes a fixed-column scanner/camera sensor artifact (e.g. a thin colored
-vertical line) from a scanned document, using a second scan of the same
-page taken in a different physical orientation.
+Some flatbed scanners leave a thin, strongly coloured vertical line at a fixed
+pixel column of every scan (here: a blue line from an Epson unit, ~25px wide at
+600dpi, ~43px at 1200dpi). This tool removes it losslessly by combining two
+scans of the same page.
 
-## The problem
+## How to scan
 
-Some scanners and phone scanning apps leave a thin, strongly-colored
-vertical line at a **fixed pixel column** in every image they produce — a
-sensor defect, light leak, or processing artifact tied to the device, not
-the page. If you scan a page once, then physically rotate the page (e.g.
-180°) and scan it again, the artifact stays at the same column in the
-file, but now lands on different page content, since the page rotated
-underneath it.
+1. Scan the page as usual (**scan 1**).
+2. Slide the page sideways by a small amount — more than the line width plus the
+   40px blend margin, a quarter inch is plenty — without rotating it, and scan
+   again (**scan 2**). Same DPI, same scan area.
+3. Stitch. Scan 1 is the base; the columns under its artifact are replaced by
+   the same content from scan 2, where the line fell somewhere else.
 
-That gives you two scans where the corrupted column differs — meaning
-each scan has clean data exactly where the other one doesn't.
+Keep the page square to the bed. The old flip-the-page-180° method still works
+with `--rotate-deg 180`, but the sideways shift keeps lighting and geometry
+identical between the two scans and aligns far better.
 
-## How it works
-
-1. **Rotate** the second scan to match the first scan's orientation
-   (default 180°, configurable for 90°/270° as well).
-2. **Align** the two scans precisely using ORB feature matching +
-   homography (RANSAC). Real-world scans/photos are rarely
-   pixel-perfect registered even after the rotation is corrected, so
-   this step accounts for any residual shift, skew, or perspective
-   difference between the two passes.
-3. **Detect** the artifact's column range in each image, by scoring how
-   much more one color channel (blue, by default) dominates the other
-   two in each column compared to the image's background.
-4. **Patch**: replace the artifact's column range in image 1 with the
-   same columns from the aligned image 2, with a feathered blend at the
-   edges so there's no visible seam.
-
-## Installation
+## Install
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Usage
+With Homebrew Python on macOS, Tk is a separate package: `brew install python-tk@3.14`
+(match your Python version). Only the GUI needs it.
+
+## Calibrate once per DPI
+
+The artifact column is a hardware constant for a given DPI, so it is detected
+once and saved, never re-detected during normal use (blue artwork could fool
+the detector). Use a scan of a mostly blank page:
 
 ```bash
-python3 stitch_remove_scanline.py image1.jpg image2.jpg -o result.jpg
+python3 stitch_remove_scanline.py blank.jpg --calibrate --dpi 600
 ```
 
-Optional flags:
+This stores the line columns, the scan's pixel width, and a default vertical
+offset (see below) in `scanner_config.json` next to the script, under
+`dpi_600`. Repeat for each DPI you scan at. The config is part of the repo on
+purpose — it *is* the scanner's calibration.
+
+## Use
+
+Command line:
+
+```bash
+python3 stitch_remove_scanline.py scan1.jpg scan2.jpg -o result.png
+```
+
+GUI (drag-and-drop):
+
+```bash
+python3 scanner_ui.py
+```
+
+Drop the two scans, check the DPI it picked up from the file, click Run. The
+output name defaults to `<scan1>_stitched.png` next to scan 1.
+
+Output is PNG by default — lossless, so the stitch adds no compression
+artifacts on top of the scanner's JPEG.
 
 | Flag | Default | Description |
 |---|---|---|
-| `-o, --output` | `stitched_result.jpg` | Output file path |
-| `--rotate-deg` | `180` | Rotation (`0`/`90`/`180`/`270`) to apply to image2 so it matches image1's orientation |
-| `--feather` | `15` | Blend feather width in pixels at the patch edges |
-| `--debug` | off | Also saves `debug_detected_line.jpg` (detected line region boxed in red on image1) and `debug_warped_image2.jpg` (the aligned second scan) — useful for sanity-checking detection/alignment on a new scan pair |
+| `-o, --output` | `stitched_result.png` | Output path |
+| `--dpi N` | from file header | Which calibration profile to use. An explicit value wins over a wrong header (edited files often say 72dpi); the scan's pixel width must match the profile either way |
+| `--rotate-deg {0,180}` | `0` | `180` for the legacy flip-the-page method |
+| `--feather N` | `40` | Blend ramp width in px on each side of the patch |
+| `--vertical-offset N` | measured | Force the sensor-step correction for both scans instead of measuring it (`0` = none) |
+| `--calibrate` | | Detect the line on `scan1` and save the profile for this DPI, then exit |
+| `--force` | | With `--calibrate`: accept a detected line far from the saved one |
+| `--debug` | | Save `debug_01…05_{full,seam}.jpg` next to the output, one per pipeline step |
 
-## How detection works
+## What it does
 
-The script looks for the image column where one color channel (blue, by
-default) dominates the other two far more than anywhere else in the
-image — characteristic of a thin, strongly-colored sensor artifact rather
-than actual drawn or printed content. This works well for artifacts that
-are highly saturated and only a few pixels wide. It's tuned for a blue
-line specifically (`detect_blue_line()`), but the channel logic is only a
-few lines to adapt if your artifact is a different color.
+1. **Vertical sensor step.** The scanner's left and right sensor halves are
+   vertically out of register at the artifact column: everything to the right
+   sits a few rows higher or lower. This is *not* a constant — at 600dpi it is
+   reliably +5px, at 1200dpi it changes from scan to scan (−9 to +2 measured on
+   the same page minutes apart). So each scan is measured individually:
+   both sides of the line are collapsed to a 1-D horizontal-edge profile,
+   cross-correlated over ±40 rows, and page skew is cancelled by subtracting
+   the same measurement taken on one side only. Both scans are then corrected
+   with a whole-row shift (no resampling). If a scan has too little — or too
+   repetitive — horizontal detail near the line to measure, the profile's
+   default is used and a warning is reported.
+2. **Alignment.** Scan 2 is warped onto scan 1 with an ORB + RANSAC homography.
+   The known column of scan 2's own artifact is pushed through that homography
+   to make sure it landed clear of the patch; on top of scan 1's line it is an
+   error (the patch would copy the artifact back in), inside the blend margin a
+   warning.
+3. **Tone match.** The patch's per-channel mean/contrast is matched to the
+   columns either side of the line.
+4. **Feather blend.** The patch replaces the artifact columns with a linear
+   alpha ramp over `--feather` px on each side.
+
+The pipeline is deterministic, so a saved output is a valid regression
+baseline (`cmp`).
 
 ## Limitations
 
-- Assumes the artifact is a thin (a few px), strongly color-dominant
-  vertical line — not suited to wide bands, faint streaks, or artifacts
-  that blend into similarly-colored page content.
-- Alignment quality depends on having enough visual texture/detail for
-  ORB to find good keypoints; a nearly blank page may not align well
-  (the script falls back to phase-correlation translation-only alignment
-  in that case, and prints a warning when it does).
-- Only patches *one* image's artifact column (image1, by default) in the
-  single merged output. If you need both orientations cleaned up, run it
-  twice, swapping which image is passed first.
+- Needs two scans of the same page; nothing is invented or inpainted.
+- The artifact must be a vertical band of strongly blue pixels for
+  calibration to find it (`detect_blue_line`); a different colour is a few
+  lines to change.
+- Rotations of 90°/270° are not supported: scan 2's artifact would become a
+  horizontal band no column patch can avoid.
+- Nearly blank pages, ruled paper and coarse halftones near the line can
+  defeat the per-scan step measurement; the profile default is used then.
+- Memory: about 2.4 GB peak for a 1200dpi letter-size pair (143 MP).
 
 ## License
 

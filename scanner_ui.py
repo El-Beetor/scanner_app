@@ -13,7 +13,6 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-import cv2
 from PIL import Image, ImageTk
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
@@ -146,9 +145,11 @@ class App(TkinterDnD.Tk):
 
         cfg = pipeline.load_config()
         dpi_choices = [k.replace("dpi_", "") for k in cfg if k.startswith("dpi_")] or ["600"]
+        self.dpi_choices = dpi_choices
         self.dpi_var = tk.StringVar(value=dpi_choices[0])
-        ttk.Combobox(opts, textvariable=self.dpi_var, values=dpi_choices,
-                     width=7, state="readonly").grid(row=0, column=1, padx=(6, 28), sticky="w")
+        self.dpi_box = ttk.Combobox(opts, textvariable=self.dpi_var, values=dpi_choices,
+                                    width=7, state="readonly")
+        self.dpi_box.grid(row=0, column=1, padx=(6, 28), sticky="w")
 
         tk.Label(opts, text="Output:", bg=BG, fg=TEXT,
                  font=("Helvetica", 12)).grid(row=0, column=2, sticky="w")
@@ -181,9 +182,37 @@ class App(TkinterDnD.Tk):
         base = os.path.splitext(os.path.basename(path))[0]
         default_out = os.path.join(os.path.dirname(path), f"{base}_stitched.png")
         self.out_var.set(default_out)
+        self._select_dpi_for(path)
+        self._check_pair_dpi()
 
-    def _on_img2(self, _):
-        pass
+    def _on_img2(self, path):
+        self._check_pair_dpi()
+
+    def _check_pair_dpi(self):
+        """Warn when the two dropped scans disagree on DPI, whichever was dropped last."""
+        if not (self.z1.path and self.z2.path):
+            return
+        d1 = pipeline.read_exif_dpi(self.z1.path)
+        d2 = pipeline.read_exif_dpi(self.z2.path)
+        if d1 and d2 and d1 != d2:
+            self._set_status(f"⚠ Scan 1 is {d1}dpi but Scan 2 is {d2}dpi — rescan at the same DPI")
+
+    def _select_dpi_for(self, path):
+        """Select the DPI profile matching the file's header; list it (with a warning)
+        if there is no calibration for it yet."""
+        dpi = pipeline.read_exif_dpi(path)
+        if not dpi:
+            self._set_status("Could not read DPI from file — check the DPI dropdown")
+            return
+        dpi = str(dpi)
+        if dpi not in self.dpi_choices:
+            self.dpi_choices.append(dpi)
+            self.dpi_box["values"] = self.dpi_choices
+            self._set_status(f"Scan is {dpi}dpi — no calibration for it yet "
+                             f"(run: stitch_remove_scanline.py scan.jpg --calibrate --dpi {dpi})")
+        else:
+            self._set_status(f"Scan is {dpi}dpi — profile selected")
+        self.dpi_var.set(dpi)
 
     def _pick_out(self):
         p = filedialog.asksaveasfilename(
@@ -207,46 +236,23 @@ class App(TkinterDnD.Tk):
     # ── Pipeline (runs in background thread) ─────────────────────────────────
     def _pipeline(self, img1_path, img2_path, output, dpi_str):
         try:
-            self._set_status("Loading images…")
-            img1 = pipeline.load_image(img1_path)
-            img2 = pipeline.load_image(img2_path)
-
-            cfg     = pipeline.load_config()
-            profile = cfg.get(pipeline.dpi_key(dpi_str), {})
-
-            # Line position — always use saved calibration, never auto-detect
-            if "line_start" in profile and "line_end" in profile:
-                x_start, x_end = profile["line_start"], profile["line_end"]
-                self._set_status(f"Using saved line: cols {x_start}–{x_end}")
+            info = pipeline.run_pipeline(img1_path, img2_path, output,
+                                         dpi=dpi_str, log=self._log)
+            steps = (f"step: scan 1 {info['vertical_offset']:+d}px, "
+                     f"scan 2 {info['vertical_offset_scan2']:+d}px")
+            name = os.path.basename(info["output"])
+            if info["warnings"]:
+                self._set_status(f"Done with warnings  ⚠  {name}  —  {steps}",
+                                 done=True, path=info["output"], warnings=info["warnings"])
             else:
-                raise RuntimeError(
-                    f"No calibration found for DPI '{dpi_str}'.\n"
-                    f"Run:  python3 stitch_remove_scanline.py img1.jpg --calibrate --dpi {dpi_str}"
-                )
-
-            v_offset = profile.get("vertical_offset", 0)
-
-            self._set_status(f"Correcting {v_offset}px vertical sensor offset…")
-            img1c = pipeline.apply_vertical_offset(img1, x_start, v_offset)
-
-            self._set_status("Aligning scan 2 to scan 1…")
-            if img2.shape[:2] != img1c.shape[:2]:
-                img2 = cv2.resize(img2, (img1c.shape[1], img1c.shape[0]))
-            warped = pipeline.align_to_base(img1c, img2)
-
-            self._set_status("Matching tone…")
-            toned = pipeline.match_local_tone(img1c, warped, x_start, x_end)
-
-            self._set_status("Blending…")
-            result = pipeline.feather_patch(img1c, toned, x_start, x_end)
-
-            cv2.imwrite(output, result)
-            self._set_status(f"Done  ✓  {os.path.basename(output)}", done=True, path=output)
-
+                self._set_status(f"Done  ✓  {name}  —  {steps}", done=True, path=info["output"])
         except Exception as exc:
             self._set_status(f"Error: {exc}", error=True)
 
-    def _set_status(self, msg, done=False, error=False, path=None):
+    def _log(self, msg):
+        self._set_status(msg.strip())
+
+    def _set_status(self, msg, done=False, error=False, path=None, warnings=None):
         def _update():
             self.status_var.set(msg)
             if done or error:
@@ -254,6 +260,12 @@ class App(TkinterDnD.Tk):
                 self.bar["value"] = 0
                 self.run_btn.config(state="normal")
             if done and path:
+                if warnings:
+                    # Each pipeline line replaces the status text, so warnings would
+                    # otherwise be gone by the time the run finishes.
+                    messagebox.showwarning(
+                        "Finished with warnings",
+                        "\n\n".join(f"• {w}" for w in warnings) + f"\n\nSaved to:\n{path}")
                 if messagebox.askyesno("Done!", f"Saved to:\n{path}\n\nReveal in Finder?"):
                     subprocess.run(["open", "-R", path])
         self.after(0, _update)
