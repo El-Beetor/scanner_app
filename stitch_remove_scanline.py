@@ -30,12 +30,15 @@ Usage:
     python3 stitch_remove_scanline.py scan1.jpg scan2.jpg -o result.png
 
     Optional flags:
-      --dpi N                       DPI profile to use (default: read from file)
-      --rotate-deg {0,90,180,270}   rotation to apply to scan 2 (default 0)
+      --dpi N                       DPI profile to use (default: read from the file
+                                    header; an explicit value wins over a wrong header)
+      --rotate-deg {0,180}          180 for the legacy flip-the-page method (default 0)
       --feather N                   blend-feather width in px (default 40)
       --vertical-offset N           force this vertical offset (px) for both scans
                                     instead of measuring it (0 = no correction)
       --calibrate                   detect line + save config for this DPI, then exit
+      --force                       with --calibrate: accept a detected line far from
+                                    the saved one (scanner or scan area changed)
       --debug                       save per-step debug images next to the output
 """
 
@@ -107,20 +110,30 @@ def resolve_dpi(dpi, image_path, log=print):
         f"could not read the DPI from {os.path.basename(image_path)}'s header; pass --dpi N")
 
 
-def check_dpi_matches(image_path, img, dpi, profile):
-    """Raise if the file's header DPI or its pixel width contradict the chosen profile.
-    Guards against running a 1200dpi scan through the 600dpi line position (which
-    would patch the wrong columns and leave the real line untouched)."""
+def check_dpi_matches(image_path, img, dpi, profile, log=print, strict_width=True):
+    """Make sure `img` really is a `dpi` scan before its columns are trusted.
+
+    The pixel width is the hard check: a 1200dpi scan run through the 600dpi
+    line position would patch the wrong columns and leave the real line intact.
+    The header DPI is only a hint — edited or re-saved files often carry 72dpi —
+    so a mismatch is logged, and is fatal only when there is no width to check.
+    calibrate() passes strict_width=False since it is what establishes the width."""
     name = os.path.basename(image_path)
     hdr = read_exif_dpi(image_path)
-    if hdr and str(hdr) != str(dpi):
-        raise PipelineError(
-            f"{name} header says {hdr}dpi but the {dpi}dpi profile was selected")
     expected = profile.get("image_width")
-    if expected and img.shape[1] != expected:
+    if hdr and str(hdr) != str(dpi):
+        if strict_width and not expected:
+            raise PipelineError(
+                f"{name} header says {hdr}dpi but the {dpi}dpi profile was selected, and the "
+                f"profile has no image_width to check instead — re-run --calibrate --dpi {dpi}")
+        log(f"  note: {name} header says {hdr}dpi; going by the {dpi}dpi profile's pixel width")
+    if strict_width and expected and img.shape[1] != expected:
         raise PipelineError(
             f"{name} is {img.shape[1]}px wide but the {dpi}dpi profile expects "
             f"{expected}px — wrong DPI selected?")
+
+
+LINE_MIN_OVERLAP = 0.5   # a re-detected line must overlap the saved one by at least this fraction
 
 
 # ── Detection and calibration measurements ────────────────────────────────────
@@ -198,8 +211,10 @@ def measure_vertical_offset(img, x_start, x_end, max_shift=40):
     measured between two strips on the *same* side (skew only) and subtracted.
 
     Returns (offset_px, confidence). confidence is the weakest correlation-peak
-    margin of the three measurements; >= OFFSET_CONFIDENCE is trustworthy, below
-    it the scan has too little horizontal detail near the line.
+    margin of the three measurements; >= OFFSET_CONFIDENCE is trustworthy. Below
+    it the scan has too little horizontal detail near the line — or too much that
+    repeats (ruled paper, or a coarse halftone with a period under ~80 rows gives
+    several equal peaks) — and the profile default is used instead.
     """
     h, w = img.shape[:2]
     lw = x_end - x_start + 1
@@ -238,7 +253,8 @@ def resolve_vertical_offset(img, forced, profile, x_start, x_end, label, log=pri
         log(f"  {label}: measured vertical offset {measured:+d}px (confidence {conf:.2f})")
         return measured
     default = profile.get("vertical_offset", 0)
-    log(f"  {label}: could not measure the vertical offset reliably (confidence {conf:.2f}); "
+    log(f"  WARNING: {label}: could not measure the vertical offset reliably (confidence "
+        f"{conf:.2f}; too little or too repetitive horizontal detail near the line) — "
         f"using the profile default {default:+d}px")
     return default
 
@@ -297,7 +313,9 @@ def align_to_base(base_img, moving_img, min_matches=15, log=print):
         gray_base.astype(np.float32), gray_moving.astype(np.float32)
     )
     log(f"  translation fallback: shift={shift}, confidence={response:.2f}")
-    M = np.array([[1, 0, shift[0]], [0, 1, shift[1]]], dtype=np.float32)
+    # phaseCorrelate reports how far `moving` is displaced from `base`; the warp
+    # that brings it back is the negative shift.
+    M = np.array([[1, 0, -shift[0]], [0, 1, -shift[1]]], dtype=np.float32)
     H = np.vstack([M, [0, 0, 1]]).astype(np.float64)
     return cv2.warpAffine(moving_img, M, (w, h)), H
 
@@ -390,47 +408,59 @@ def save_debug_steps(out_dir, x_start, x_end, steps, log=print):
 
 # ── Entry points ──────────────────────────────────────────────────────────────
 
-def calibrate(image1, dpi=None, vertical_offset=None, config_path=CONFIG_PATH, log=print):
-    """Detect the artifact line in image1 and store it (plus the vertical sensor
-    offset) in the config under this DPI's profile. Returns the profile dict."""
+def calibrate(image1, dpi=None, vertical_offset=None, force=False,
+              config_path=CONFIG_PATH, log=print):
+    """Detect the artifact line in image1 and store it, the scan width and a
+    default vertical offset in the config under this DPI's profile.
+    Returns the profile dict."""
     img1 = load_image(image1)
     cfg = load_config(config_path)
     dpi = resolve_dpi(dpi, image1, log)
     profile = cfg.get(dpi_key(dpi), {})
-    check_dpi_matches(image1, img1, dpi, profile)
+    check_dpi_matches(image1, img1, dpi, profile, log, strict_width=False)
 
     have_line = "line_start" in profile and "line_end" in profile
-    if have_line and vertical_offset is not None:
-        # Only setting the default offset on an existing profile: keep the line as is,
-        # since the image given here may not be a good one to detect it on.
-        x_start, x_end = profile["line_start"], profile["line_end"]
+    saved = (profile.get("line_start"), profile.get("line_end"))
+    width_changed = have_line and profile.get("image_width") not in (None, img1.shape[1])
+    if width_changed:
+        log(f"  scan width changed ({profile['image_width']} -> {img1.shape[1]}px); "
+            "the line position will be re-detected")
+
+    if have_line and vertical_offset is not None and not width_changed:
+        # Only setting the default offset: keep the saved line, since the image
+        # given here may not be a good one to detect it on.
+        x_start, x_end = saved
         log(f"Keeping saved line position: columns {x_start}-{x_end}")
     else:
         log("Detecting artifact line...")
         line = detect_blue_line(img1)
         if line is None:
-            raise PipelineError("could not detect a blue artifact line — calibrate on a "
-                                "scan of a mostly blank, non-blue page")
-        x_start, x_end = line
-        log(f"  found at columns {x_start}-{x_end} (width {x_end - x_start + 1}px)")
-        if have_line and (x_start, x_end) != (profile["line_start"], profile["line_end"]):
-            log(f"  (replaces previously saved {profile['line_start']}-{profile['line_end']})")
+            if have_line and not width_changed:
+                x_start, x_end = saved
+                log(f"  WARNING: no line detected in this scan; keeping saved columns {x_start}-{x_end}")
+            else:
+                raise PipelineError("could not detect a blue artifact line — calibrate on a "
+                                    "scan of a mostly blank, non-blue page")
+        else:
+            x_start, x_end = line
+            log(f"  found at columns {x_start}-{x_end} (width {x_end - x_start + 1}px)")
+            if have_line and not width_changed and (x_start, x_end) != saved:
+                # The detected edges wander a few px between scans; a detector hijacked
+                # by blue content lands somewhere else entirely, so judge by overlap.
+                overlap = min(x_end, saved[1]) - max(x_start, saved[0]) + 1
+                if overlap < LINE_MIN_OVERLAP * (saved[1] - saved[0] + 1) and not force:
+                    raise PipelineError(
+                        f"detected line {x_start}-{x_end} barely overlaps the saved "
+                        f"{saved[0]}-{saved[1]} — blue content in this scan may have fooled the "
+                        "detector. Calibrate on a blank page, or pass --force if the scanner "
+                        "setup really changed")
+                log(f"  (replaces previously saved {saved[0]}-{saved[1]})")
 
     # The step is measured per scan at stitch time; the profile only stores a
     # default for scans that are too blank near the line to measure.
-    if vertical_offset is not None:
-        v_offset = vertical_offset
-        log(f"Default vertical offset set to {v_offset:+d}px")
-    else:
-        measured, conf = measure_vertical_offset(img1, x_start, x_end)
-        if conf >= OFFSET_CONFIDENCE:
-            v_offset = measured
-            log(f"Measured vertical offset on this scan: {measured:+d}px (confidence {conf:.2f}) "
-                f"— saved as the profile default")
-        else:
-            v_offset = profile.get("vertical_offset", 0)
-            log(f"Could not measure the vertical offset reliably on this scan (confidence "
-                f"{conf:.2f}); default stays {v_offset:+d}px — pass --vertical-offset N to set it")
+    v_offset = resolve_vertical_offset(img1, vertical_offset, profile, x_start, x_end,
+                                       "calibration scan", log)
+    log(f"Profile default vertical offset: {v_offset:+d}px")
 
     profile["line_start"] = x_start
     profile["line_end"] = x_end
@@ -469,59 +499,79 @@ def run_pipeline(image1, image2, output, dpi=None, vertical_offset=None, feather
             f"Run:  python3 stitch_remove_scanline.py scan1.jpg --calibrate --dpi {dpi}"
         )
 
-    check_dpi_matches(image1, img1, dpi, profile)
+    warnings = []
+
+    def _log(msg):                                  # pass through, collecting WARNING lines
+        if "WARNING:" in msg:
+            warnings.append(msg.split("WARNING:", 1)[1].strip())
+        log(msg)
+
+    if rotate_deg not in (0, 180):
+        raise PipelineError("rotate_deg must be 0 or 180: at 90/270 scan 2's artifact becomes "
+                            "a horizontal band that no column patch can avoid")
+
+    check_dpi_matches(image1, img1, dpi, profile, _log)
 
     img2 = load_image(image2)
-    rot_map = {0: None, 90: cv2.ROTATE_90_CLOCKWISE,
-               180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
-    img2_oriented = img2 if rot_map[rotate_deg] is None else cv2.rotate(img2, rot_map[rotate_deg])
-    check_dpi_matches(image2, img2_oriented, dpi, profile)
-    if img2_oriented.shape[:2] != img1.shape[:2]:
+    check_dpi_matches(image2, img2, dpi, profile, _log)
+    if img2.shape[:2] != img1.shape[:2]:
         # Same scanner + same DPI + same scan area always gives identical sizes;
         # anything else means the line column is wrong too, so don't resize-and-hope.
         raise PipelineError(
             f"scan sizes differ: {os.path.basename(image1)} is {img1.shape[1]}x{img1.shape[0]}, "
-            f"{os.path.basename(image2)} is {img2_oriented.shape[1]}x{img2_oriented.shape[0]} — "
+            f"{os.path.basename(image2)} is {img2.shape[1]}x{img2.shape[0]} — "
             "both scans must use the same DPI and scan area")
 
     # The scanner's left/right sensor halves are vertically out of step, and the
     # step differs from scan to scan, so each scan is measured and corrected on
-    # its own. Scan 2 matters too: the patch comes from its right half, and an
-    # uncorrected step there makes the homography split the difference.
-    log("Measuring vertical sensor step in each scan...")
-    v1 = resolve_vertical_offset(img1, vertical_offset, profile, x_start, x_end, "scan 1", log)
-    if rotate_deg == 0:
-        v2 = resolve_vertical_offset(img2_oriented, vertical_offset, profile, x_start, x_end, "scan 2", log)
-    else:
-        v2 = 0
-        log("  scan 2: rotated, so its line column is unknown — not corrected")
+    # its own, in its native frame (the line sits at x_start in both). Scan 2
+    # matters too: the patch comes from its right half, and an uncorrected step
+    # there makes the homography split the difference.
+    _log("Measuring vertical sensor step in each scan...")
+    v1 = resolve_vertical_offset(img1, vertical_offset, profile, x_start, x_end, "scan 1", _log)
+    v2 = resolve_vertical_offset(img2, vertical_offset, profile, x_start, x_end, "scan 2", _log)
     img1_corrected = apply_vertical_offset(img1, x_start, v1)
-    img2_corrected = apply_vertical_offset(img2_oriented, x_start, v2)
+    img2_corrected = apply_vertical_offset(img2, x_start, v2)
+    del img2                                        # ~0.4 GB at 1200dpi
 
-    log("Aligning image2 onto image1's frame...")
-    warped2, H = align_to_base(img1_corrected, img2_corrected, log=log)
-    del img2, img2_oriented, img2_corrected      # ~0.4 GB each at 1200dpi; no longer needed
+    if rotate_deg == 180:                           # legacy flip-the-page workflow
+        img2_corrected = cv2.rotate(img2_corrected, cv2.ROTATE_180)
+        w = img1.shape[1]
+        line2 = (w - 1 - x_end, w - 1 - x_start)    # scan 2's line column after the flip
+    else:
+        line2 = (x_start, x_end)
 
-    # Scan 2's own artifact sits at the same column in its own frame. See where the
-    # alignment put it and make sure it is clear of the window the patch comes from.
-    if rotate_deg == 0:
-        l2_start, l2_end = warped_line_columns(H, x_start, x_end, img1.shape[0])
-        patch_lo, patch_hi = x_start - feather, x_end + feather
-        if l2_end >= patch_lo and l2_start <= patch_hi:
-            log(f"  WARNING: scan 2's own artifact line lands at columns {l2_start}-{l2_end}, "
-                f"inside the {patch_lo}-{patch_hi} window the patch is taken from — "
-                "the artifact will remain; shift scan 2 further next time")
-        else:
-            log(f"  scan 2's own line lands at columns {l2_start}-{l2_end} (clear of the patch window)")
+    _log("Aligning image2 onto image1's frame...")
+    warped2, H = align_to_base(img1_corrected, img2_corrected, log=_log)
+    del img2_corrected
 
-    log("Matching local tone of patch to surrounding image...")
+    # See where the alignment put scan 2's own artifact line. On top of scan 1's
+    # line the patch would copy the artifact straight back in; inside the blend
+    # margin a faint trace can survive.
+    l2_start, l2_end = warped_line_columns(H, line2[0], line2[1], img1.shape[0])
+    patch_lo, patch_hi = x_start - feather, x_end + feather
+    if l2_end >= x_start and l2_start <= x_end:
+        raise PipelineError(
+            f"scan 2's own artifact line lands at columns {l2_start}-{l2_end}, on top of "
+            f"scan 1's ({x_start}-{x_end}) — the patch would copy the artifact back in. "
+            "Shift scan 2 further sideways and rescan")
+    if l2_end >= patch_lo and l2_start <= patch_hi:
+        _log(f"  WARNING: scan 2's artifact line lands at columns {l2_start}-{l2_end}, inside "
+             f"the blend margin ({patch_lo}-{patch_hi}) — a faint trace may remain; shift "
+             "scan 2 further next time")
+    else:
+        _log(f"  scan 2's own line lands at columns {l2_start}-{l2_end} (clear of the patch window)")
+
+    _log("Matching local tone of patch to surrounding image...")
     warped2_toned = match_local_tone(img1_corrected, warped2, x_start, x_end)
 
-    log("Blending with feather...")
+    _log("Blending with feather...")
     result = feather_patch(img1_corrected, warped2_toned, x_start, x_end, feather=feather)
 
-    cv2.imwrite(output, result)
-    log(f"Saved result: {output}")
+    if not cv2.imwrite(output, result):
+        raise PipelineError(f"could not write {output} — does the folder exist, and is the "
+                            "extension one OpenCV can write (.png/.jpg/.tif)?")
+    _log(f"Saved result: {output}")
 
     if debug:
         out_dir = os.path.dirname(os.path.abspath(output))
@@ -531,10 +581,10 @@ def run_pipeline(image1, image2, output, dpi=None, vertical_offset=None, feather
             ("03_img2_aligned",     warped2,         f"Image 2 after {v2:+d}px correction + homography alignment"),
             ("04_img2_tone_matched", warped2_toned,  "Image 2 after local tone matching"),
             ("05_final_result",     result,          "Final blended result"),
-        ], log=log)
+        ], log=_log)
 
     return {"output": output, "dpi": dpi, "line": (x_start, x_end),
-            "vertical_offset": v1, "vertical_offset_scan2": v2}
+            "vertical_offset": v1, "vertical_offset_scan2": v2, "warnings": warnings}
 
 
 def main():
@@ -546,19 +596,24 @@ def main():
     ap.add_argument("-o", "--output", default="stitched_result.png")
     ap.add_argument("--dpi", type=int, default=None,
                     help="DPI profile to use (default: read from image header)")
-    ap.add_argument("--rotate-deg", type=int, choices=[0, 90, 180, 270], default=0)
+    ap.add_argument("--rotate-deg", type=int, choices=[0, 180], default=0,
+                    help="180 for the legacy flip-the-page method (default 0)")
     ap.add_argument("--feather", type=int, default=40)
     ap.add_argument("--vertical-offset", type=int, default=None,
-                    help="override saved sensor offset (pixels, positive = right side too low)")
+                    help="force this sensor offset for both scans instead of measuring it "
+                         "(pixels, positive = right side too low; 0 = no correction)")
     ap.add_argument("--calibrate", action="store_true",
                     help="detect line position + save config for this DPI, then exit")
+    ap.add_argument("--force", action="store_true",
+                    help="with --calibrate: accept a detected line far from the saved one")
     ap.add_argument("--debug", action="store_true",
                     help="save per-step debug images next to the output")
     args = ap.parse_args()
 
     try:
         if args.calibrate:
-            calibrate(args.image1, dpi=args.dpi, vertical_offset=args.vertical_offset)
+            calibrate(args.image1, dpi=args.dpi, vertical_offset=args.vertical_offset,
+                      force=args.force)
             return
         if args.image2 is None:
             ap.error("image2 is required for normal (non-calibrate) use")
